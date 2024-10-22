@@ -15,7 +15,7 @@ class CreatePolygonForWHMCSInvoicesTable
         /** @var  Illuminate\Support\Facades\Schema $schema */
         $schema = Capsule::schema();
 
-        if (!$schema->hasTable('mod_polygonforwhmcs_pay_invoices')) {
+        if (! $schema->hasTable('mod_polygonforwhmcs_pay_invoices')) {
             $schema->create('mod_polygonforwhmcs_pay_invoices', function (Blueprint $table) {
                 $table->id();
                 $table->integer('invoice_id');

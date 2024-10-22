@@ -1,10 +1,10 @@
 <?php
 
-if (!defined('Polygon_PAY_ROOT')) {
+if (! defined('Polygon_PAY_ROOT')) {
     define('Polygon_PAY_ROOT', __DIR__);
 }
 
-if (!defined('WHMCS_ROOT')) {
+if (! defined('WHMCS_ROOT')) {
     define('WHMCS_ROOT', dirname(__DIR__, 3));
 }
 

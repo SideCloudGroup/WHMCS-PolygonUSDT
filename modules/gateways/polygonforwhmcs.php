@@ -2,7 +2,7 @@
 
 use PolygonForWHMCS\App;
 
-if (!defined("WHMCS")) {
+if (! defined("WHMCS")) {
     die("This file cannot be accessed directly");
 }
 
@@ -22,8 +22,7 @@ function polygonforwhmcs_MetaData()
 {
     return array(
         'DisplayName' => 'Polygon Crypto Payment for WHMCS',
-        'APIVersion' => '1.1',
-        // Use API Version 1.1
+        'APIVersion' => '1.2',
         'DisableLocalCreditCardInput' => true,
         'TokenisedStorage' => false,
     );
@@ -55,9 +54,9 @@ function polygonforwhmcs_config()
  *
  * @param array $params Payment Gateway Module Parameters
  *
+ * @return string
  * @see https://developers.whmcs.com/payment-gateways/third-party-gateway/
  *
- * @return string
  */
 function polygonforwhmcs_link(array $params)
 {

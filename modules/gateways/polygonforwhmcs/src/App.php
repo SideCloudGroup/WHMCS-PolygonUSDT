@@ -2,17 +2,17 @@
 
 namespace PolygonForWHMCS;
 
-use PolygonForWHMCS\Exceptions\NoAddressAvailable;
-use PolygonForWHMCS\Models\PolygonForWHMCSInvoice;
-use PolygonForWHMCS\Models\Invoice;
-use PolygonForWHMCS\Models\Transaction;
 use Carbon\Carbon;
-use WHMCS\Database\Capsule;
 use GuzzleHttp\Client;
 use Illuminate\Support\Collection;
+use PolygonForWHMCS\Exceptions\NoAddressAvailable;
+use PolygonForWHMCS\Models\Invoice;
+use PolygonForWHMCS\Models\PolygonForWHMCSInvoice;
+use PolygonForWHMCS\Models\Transaction;
 use RuntimeException;
 use Smarty;
 use Throwable;
+use WHMCS\Database\Capsule;
 
 class App
 {
@@ -38,19 +38,25 @@ class App
             'Type' => 'textarea',
             'Rows' => '20',
             'Cols' => '30',
+            'Description' => 'Polygon钱包地址，每行一个',
         ],
         'timeout' => [
             'FriendlyName' => 'Timeout',
             'Type' => 'text',
             'Value' => 30,
-            'Description' => 'Minutes'
+            'Description' => '超时时间，单位分钟'
         ],
         'apikey' => [
             'FriendlyName' => 'Polygonscan ApiKey',
             'Type' => 'text',
-            // 'Value' => 30,
-            'Description' => ''
-        ]
+            'Description' => 'PolygonScan ApiKey',
+        ],
+        'exchangeRateDeviation' => [
+            'FriendlyName' => 'Exchange Rate Deviation',
+            'Type' => 'text',
+            'Value' => 1.00,
+            'Description' => '汇率偏移值'
+        ],
     ];
 
     /**
@@ -63,19 +69,19 @@ class App
     /**
      * Create a new instance.
      *
-     * @param   string  $addresses
-     * @param   bool    $configMode
+     * @param string $addresses
+     * @param bool $configMode
      *
      * @return  void
      */
     public function __construct(array $params = [])
     {
-        if (!function_exists('getGatewayVariables')) {
+        if (! function_exists('getGatewayVariables')) {
             require_once dirname(__DIR__, 3) . DIRECTORY_SEPARATOR . 'init.php';
             require_once dirname(__DIR__, 3) . DIRECTORY_SEPARATOR . 'includes/gatewayfunctions.php';
             require_once dirname(__DIR__, 3) . DIRECTORY_SEPARATOR . 'includes/invoicefunctions.php';
         } else {
-            if (empty($params) && !$configMode) {
+            if (empty($params) && ! $configMode) {
                 try {
                     $params = getGatewayVariables('polygonforwhmcs');
                 } catch (Throwable $e) {
@@ -86,27 +92,11 @@ class App
         $this->timeout = $params['timeout'] ?? 30;
         $this->addresses = array_filter(preg_split("/\r\n|\n|\r/", $params['addresses'] ?? ''));
         $this->apikey = $params['apikey'];
+        $this->exchangeRateDeviation = (float) $params['exchangeRateDeviation'] ?? 1.00;
 
         $this->smarty = new Smarty();
         $this->smarty->setTemplateDir(Polygon_PAY_ROOT . DIRECTORY_SEPARATOR . 'templates');
         $this->smarty->setCompileDir(WHMCS_ROOT . DIRECTORY_SEPARATOR . 'templates_c');
-    }
-
-    /**
-     * Fetch smarty renderred template.
-     *
-     * @param   string  $viewName
-     * @param   array   $arguments
-     *
-     * @return  string
-     */
-    protected function view(string $viewName, array $arguments = [])
-    {
-        foreach ($arguments as $name => $variable) {
-            $this->smarty->assign($name, $variable);
-        }
-
-        return $this->smarty->fetch($viewName);
     }
 
     /**
@@ -143,7 +133,7 @@ class App
     /**
      * Render payment html.
      *
-     * @param   array  $params
+     * @param array $params
      *
      * @return  mixed
      */
@@ -160,44 +150,9 @@ class App
     }
 
     /**
-     * Create beefy asian pay invoice.
-     *
-     * @param   array  $params
-     *
-     * @return  void
-     */
-    protected function createPolygonForWHMCSInvoice(array $params)
-    {
-        try {
-            $invoice = (new Invoice())->find($params['invoiceid']);
-
-            if (mb_strtolower($invoice['status']) === 'paid') {
-                $this->json([
-                    'status' => false,
-                    'error' => 'The invoice has been paid in full.'
-                ]);
-            } else {
-                $address = $this->getAvailableAddress($params['invoiceid']);
-                // $start_block = $this->getNowPolygonBlock();
-
-                $this->json([
-                    'status' => true,
-                    'address' => $address,
-                    // 'start_block' => $start_block,
-                ]);
-            }
-        } catch (Throwable $e) {
-            $this->json([
-                'status' => false,
-                'error' => $e->getMessage(),
-            ]);
-        }
-    }
-
-    /**
      * Get then invoice status json.
      *
-     * @param   array   $params
+     * @param array $params
      *
      * @return  void
      */
@@ -233,87 +188,9 @@ class App
     }
 
     /**
-     * Responed with JSON.
-     *
-     * @param   array  $json
-     *
-     * @return  void
-     */
-    protected function json(array $json)
-    {
-        $json = json_encode($json);
-        header('Content-Type: application/json');
-        echo $json;
-
-        if (function_exists('fastcgi_finish_request')) {
-            fastcgi_finish_request();
-        } else {
-            exit();
-        }
-    }
-
-    /**
-     * Render pay with usdt html.
-     *
-     * @param   array   $params
-     *
-     * @return  string
-     */
-    protected function renderPaymentHTML(array $params): string
-    {
-        $polygonInvoice = new PolygonForWHMCSInvoice();
-
-        if ($validAddress = $polygonInvoice->validInvoice($params['invoiceid'])) {
-            $validAddress->renew($this->timeout);
-            $validTill = Carbon::now()->addMinutes($this->timeout)->toDateTimeString();
-
-            $Currencyrate = Capsule::table("tblcurrencies")->where("code", "USD")->value("rate");
-            $Currencydefault = Capsule::table("tblcurrencies")->where("code", "USD")->value("default");
-            if ($Currencydefault == '1') {
-                $amount = $params['amount'];
-            } else {
-                $amount = $params['amount'] * $Currencyrate;
-            }
-            return $this->view('payment.tpl', [
-                'address' => $validAddress['to_address'],
-                'amount' => $amount,
-                'validTill' => $validTill,
-            ]);
-        } else {
-            return $this->view('pay_with_usdt.tpl');
-        }
-    }
-
-    /**
-     * Remove expired invoices.
-     *
-     * @return  void
-     */
-    public function cron()
-    {
-        $this->checkPaidInvoice();
-
-        (new PolygonForWHMCSInvoice())->markExpiredInvoiceAsReleased();
-    }
-
-    /**
-     * Check paid invoices.
-     *
-     * @return  void
-     */
-    protected function checkPaidInvoice()
-    {
-        $invoices = (new PolygonForWHMCSInvoice())->getValidInvoices();
-
-        $invoices->each(function ($invoice) {
-            $this->checkTransaction($invoice);
-        });
-    }
-
-    /**
      * Check USDT Transaction.
      *
-     * @param   PolygonForWHMCSInvoice  $invoice
+     * @param PolygonForWHMCSInvoice $invoice
      *
      * @return  void
      */
@@ -341,7 +218,7 @@ class App
                 if ($Currencydefault == '1') {
                     $actualAmount = $transaction['value'] / 1000000;
                 } else {
-                    $actualAmount = ($transaction['value'] / 1000000) / $Currencyrate;
+                    $actualAmount = ($transaction['value'] / 1000000) / $Currencyrate / $this->exchangeRateDeviation;
                 }
 
                 AddInvoicePayment(
@@ -353,7 +230,7 @@ class App
                     0,
                     // Transaction fee
                     'polygonforwhmcs' // Gateway
-    
+
                 );
 
                 logTransaction('PolygonForWHMCS', $transaction, 'Successfully Paid');
@@ -371,8 +248,8 @@ class App
     /**
      * Get TRC 20 address transactions.
      *
-     * @param   string  $address
-     * @param   int  $startblock
+     * @param string $address
+     * @param int $startblock
      *
      * @return  Collection
      */
@@ -396,14 +273,68 @@ class App
             ],
         ]);
         $response = json_decode($response->getBody()->getContents(), true);
-        // var_dump(new Collection($response['result']));
         return new Collection($response['result']);
+    }
+
+    /**
+     * Responed with JSON.
+     *
+     * @param array $json
+     *
+     * @return  void
+     */
+    protected function json(array $json)
+    {
+        $json = json_encode($json);
+        header('Content-Type: application/json');
+        echo $json;
+
+        if (function_exists('fastcgi_finish_request')) {
+            fastcgi_finish_request();
+        } else {
+            exit();
+        }
+    }
+
+    /**
+     * Create beefy asian pay invoice.
+     *
+     * @param array $params
+     *
+     * @return  void
+     */
+    protected function createPolygonForWHMCSInvoice(array $params)
+    {
+        try {
+            $invoice = (new Invoice())->find($params['invoiceid']);
+
+            if (mb_strtolower($invoice['status']) === 'paid') {
+                $this->json([
+                    'status' => false,
+                    'error' => 'The invoice has been paid in full.'
+                ]);
+            } else {
+                $address = $this->getAvailableAddress($params['invoiceid']);
+                // $start_block = $this->getNowPolygonBlock();
+
+                $this->json([
+                    'status' => true,
+                    'address' => $address,
+                    // 'start_block' => $start_block,
+                ]);
+            }
+        } catch (Throwable $e) {
+            $this->json([
+                'status' => false,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**
      * Get an available usdt address.
      *
-     * @param   int     $invoiceId
+     * @param int $invoiceId
      *
      * @return  string
      *
@@ -451,5 +382,80 @@ class App
         $response = json_decode($response->getBody()->getContents(), true);
 
         return $response['result'];
+    }
+
+    /**
+     * Render pay with usdt html.
+     *
+     * @param array $params
+     *
+     * @return  string
+     */
+    protected function renderPaymentHTML(array $params): string
+    {
+        $polygonInvoice = new PolygonForWHMCSInvoice();
+
+        if ($validAddress = $polygonInvoice->validInvoice($params['invoiceid'])) {
+            $validAddress->renew($this->timeout);
+            $validTill = Carbon::now()->addMinutes($this->timeout)->toDateTimeString();
+
+            $Currencyrate = Capsule::table("tblcurrencies")->where("code", "USD")->value("rate");
+            $Currencydefault = Capsule::table("tblcurrencies")->where("code", "USD")->value("default");
+            if ($Currencydefault == '1') {
+                $amount = $params['amount'];
+            } else {
+                $amount = $params['amount'] * $Currencyrate * $this->exchangeRateDeviation;
+            }
+            return $this->view('payment.tpl', [
+                'address' => $validAddress['to_address'],
+                'amount' => $amount,
+                'validTill' => $validTill,
+            ]);
+        } else {
+            return $this->view('pay_with_usdt.tpl');
+        }
+    }
+
+    /**
+     * Fetch smarty renderred template.
+     *
+     * @param string $viewName
+     * @param array $arguments
+     *
+     * @return  string
+     */
+    protected function view(string $viewName, array $arguments = [])
+    {
+        foreach ($arguments as $name => $variable) {
+            $this->smarty->assign($name, $variable);
+        }
+
+        return $this->smarty->fetch($viewName);
+    }
+
+    /**
+     * Remove expired invoices.
+     *
+     * @return  void
+     */
+    public function cron()
+    {
+        $this->checkPaidInvoice();
+
+        (new PolygonForWHMCSInvoice())->markExpiredInvoiceAsReleased();
+    }
+
+    /**
+     * Check paid invoices.
+     *
+     * @return  void
+     */
+    protected function checkPaidInvoice()
+    {
+        $invoices = (new PolygonForWHMCSInvoice())->getValidInvoices();
+
+        $invoices->each(function ($invoice) {
+            $this->checkTransaction($invoice);
+        });
     }
 }

@@ -16,9 +16,9 @@ class Transaction extends Model
     /**
      * Find transaction by transaction id.
      *
-     * @param   string  $transId
+     * @param string $transId
      *
-     * @return  \Illuminate\Database\Eloquent\Model|null
+     * @return  Model|null
      */
     public function firstByTransId(string $transId)
     {

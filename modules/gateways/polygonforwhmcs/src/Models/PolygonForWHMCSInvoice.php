@@ -3,8 +3,9 @@
 namespace PolygonForWHMCS\Models;
 
 use Carbon\Carbon;
-use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Collection;
 
 class PolygonForWHMCSInvoice extends Model
 {
@@ -42,7 +43,7 @@ class PolygonForWHMCSInvoice extends Model
     /**
      * In use condition.
      *
-     * @param   Builder  $builder
+     * @param Builder $builder
      *
      * @return  Builder
      */
@@ -54,9 +55,9 @@ class PolygonForWHMCSInvoice extends Model
     /**
      * Assoicated with an invoice.
      *
-     * @param   string  $address
-     * @param   int     $invoiceId
-     * @param   int     $timeout
+     * @param string $address
+     * @param int $invoiceId
+     * @param int $timeout
      *
      * @return  void
      */
@@ -73,9 +74,9 @@ class PolygonForWHMCSInvoice extends Model
     /**
      * Determine if there is an invoice within the validity period.
      *
-     * @param   int  $invoiceId
+     * @param int $invoiceId
      *
-     * @return  \Illuminate\Support\Collection
+     * @return  Collection
      */
     public function validInvoice(int $invoiceId)
     {
@@ -89,7 +90,7 @@ class PolygonForWHMCSInvoice extends Model
     /**
      * Update the expires date.
      *
-     * @param   int  $timeout
+     * @param int $timeout
      *
      * @return  bool
      */
@@ -116,7 +117,7 @@ class PolygonForWHMCSInvoice extends Model
     /**
      * Get all valid invoices.
      *
-     * @return  \Illuminate\Support\Collection
+     * @return  Collection
      */
     public function getValidInvoices()
     {
@@ -129,8 +130,8 @@ class PolygonForWHMCSInvoice extends Model
     /**
      * Mark inovice as paid.
      *
-     * @param  string  $fromAddress
-     * @param  string  $transactionId
+     * @param string $fromAddress
+     * @param string $transactionId
      *
      * @return  void
      */
@@ -147,9 +148,9 @@ class PolygonForWHMCSInvoice extends Model
     /**
      * Get polygonforwhmcs pay valid invoice by invoice id.
      *
-     * @param   int  $invoiceId
+     * @param int $invoiceId
      *
-     * @return  \Illuminate\Database\Eloquent\Model|null
+     * @return  Model|null
      */
     public function firstValidByInvoiceId(int $invoiceId)
     {

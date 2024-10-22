@@ -3,6 +3,7 @@
 namespace PolygonForWHMCS\Models;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class Invoice extends Model
 {
@@ -17,7 +18,7 @@ class Invoice extends Model
     /**
      * Invoice transactions.
      *
-     * @return  \Illuminate\Database\Eloquent\Relations\HasMany
+     * @return  HasMany
      */
     public function transactions()
     {
