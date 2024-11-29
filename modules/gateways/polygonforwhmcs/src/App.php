@@ -216,7 +216,7 @@ class App
                 $Currencyrate = Capsule::table("tblcurrencies")->where("code", "USD")->value("rate");
                 $Currencydefault = Capsule::table("tblcurrencies")->where("code", "USD")->value("default");
                 if ($Currencydefault == '1') {
-                    $actualAmount = $transaction['value'] / 1000000;
+                    $actualAmount = $transaction['value'] / 1000000 / $this->exchangeRateDeviation;
                 } else {
                     $actualAmount = ($transaction['value'] / 1000000) / $Currencyrate / $this->exchangeRateDeviation;
                 }
@@ -402,7 +402,7 @@ class App
             $Currencyrate = Capsule::table("tblcurrencies")->where("code", "USD")->value("rate");
             $Currencydefault = Capsule::table("tblcurrencies")->where("code", "USD")->value("default");
             if ($Currencydefault == '1') {
-                $amount = $params['amount'];
+                $amount = $params['amount'] * $this->exchangeRateDeviation;
             } else {
                 $amount = $params['amount'] * $Currencyrate * $this->exchangeRateDeviation;
             }
