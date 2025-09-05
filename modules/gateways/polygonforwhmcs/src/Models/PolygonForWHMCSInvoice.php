@@ -10,14 +10,14 @@ use Illuminate\Support\Collection;
 class PolygonForWHMCSInvoice extends Model
 {
     /**
-     * The table associated with the model.
+     * 模型关联的数据表
      *
      * @var string
      */
     protected $table = 'mod_polygonforwhmcs_pay_invoices';
 
     /**
-     * The attributes that are mass assignable.
+     * 可批量赋值的字段
      *
      * @var string[]
      */
@@ -28,24 +28,36 @@ class PolygonForWHMCSInvoice extends Model
         'transaction_id',
         'expires_on',
         'is_released',
-        "start_block",
+        'start_block',
+        'usdt_amount',
+        'original_amount',
+        'currency',
+        'exchange_rate',
+        'rate_deviation',
+        'is_paid',
     ];
 
     /**
-     * The attributes that should be cast to native type.
+     * 字段类型转换配置
      *
      * @var string[]
      */
     protected $casts = [
         'expires_on' => 'datetime',
+        'usdt_amount' => 'decimal:2',
+        'original_amount' => 'decimal:2',
+        'exchange_rate' => 'decimal:6',
+        'rate_deviation' => 'decimal:6',
+        'is_paid' => 'boolean',
+        'is_released' => 'boolean',
     ];
 
     /**
-     * In use condition.
+     * 查询正在使用的地址
      *
      * @param Builder $builder
      *
-     * @return  Builder
+     * @return Builder
      */
     public function scopeInUse(Builder $builder): Builder
     {
@@ -61,13 +73,44 @@ class PolygonForWHMCSInvoice extends Model
      *
      * @return  void
      */
-    public function associate(string $address, int $invoiceId, int $timeout = 30, string $start_block)
+    /**
+     * Associate address with invoice and store payment information
+     *
+     * @param string $address
+     * @param int $invoiceId
+     * @param int $timeout
+     * @param string $start_block
+     * @param float $usdtAmount
+     * @param float $originalAmount
+     * @param string $currency
+     * @param float $exchangeRate
+     * @param float $rateDeviation
+     * @return self
+     */
+    public function associate(
+        string $address,
+        int    $invoiceId,
+        int    $timeout = 30,
+        string $start_block = '0',
+        float  $usdtAmount = 0,
+        float  $originalAmount = 0,
+        string $currency = 'USD',
+        float  $exchangeRate = 1,
+        float  $rateDeviation = 1
+    ): self
     {
-        $this->newQuery()->create([
+        return $this->newQuery()->create([
             'to_address' => $address,
             'invoice_id' => $invoiceId,
             'expires_on' => Carbon::now()->addMinutes($timeout),
             'start_block' => $start_block,
+            'usdt_amount' => $usdtAmount,
+            'original_amount' => $originalAmount,
+            'currency' => $currency,
+            'exchange_rate' => $exchangeRate,
+            'rate_deviation' => $rateDeviation,
+            'is_paid' => false,
+            'is_released' => false,
         ]);
     }
 
@@ -140,6 +183,7 @@ class PolygonForWHMCSInvoice extends Model
         $this->forceFill([
             'from_address' => $fromAddress,
             'transaction_id' => $transactionId,
+            'is_paid' => true,
             'is_released' => true,
         ])
             ->save();

@@ -22,7 +22,7 @@ function polygonforwhmcs_MetaData()
 {
     return array(
         'DisplayName' => 'Polygon Crypto Payment for WHMCS',
-        'APIVersion' => '1.2',
+        'APIVersion' => '2.0',
         'DisableLocalCreditCardInput' => true,
         'TokenisedStorage' => false,
     );
