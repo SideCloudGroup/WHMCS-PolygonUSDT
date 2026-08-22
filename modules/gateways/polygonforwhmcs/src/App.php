@@ -113,7 +113,7 @@ class App
         $this->timeout = $params['timeout'] ?? 30;
         $this->addresses = array_filter(preg_split("/\r\n|\n|\r/", $params['addresses'] ?? ''));
         $this->apikey = $params['apikey'];
-        $this->exchangeRateDeviation = (float) $params['exchangeRateDeviation'] ?? 1.00;
+        $this->exchangeRateDeviation = $this->normalizeDeviation($params['exchangeRateDeviation'] ?? null);
 
         $this->smarty = new Smarty();
         $this->smarty->setTemplateDir(Polygon_PAY_ROOT . DIRECTORY_SEPARATOR . 'templates');
@@ -161,11 +161,13 @@ class App
      */
     public function render(array $params)
     {
-        switch ($_GET['act']) {
+        switch ($_GET['act'] ?? '') {
             case 'invoice_status':
                 $this->renderInvoiceStatusJson($params);
+                return;
             case 'create':
                 $this->createPolygonForWHMCSInvoice($params);
+                return;
             default:
                 return $this->renderPaymentHTML($params);
         }
@@ -384,29 +386,18 @@ class App
                     'error' => 'The invoice has been paid in full.'
                 ]);
             } else {
-                // 使用bcmath高精度计算USDT金额
-                $Currencyrate = Capsule::table("tblcurrencies")->where("code", "USD")->value("rate");
-                $Currencydefault = Capsule::table("tblcurrencies")->where("code", "USD")->value("default");
-
-                if ($Currencydefault == '1') {
-                    // USD为默认货币：原始金额 × 汇率偏移
-                    $usdtAmount = bcmul((string) $params['amount'], (string) $this->exchangeRateDeviation, 2);
-                } else {
-                    // 其他货币：原始金额 × USD汇率 × 汇率偏移
-                    $tempAmount = bcmul((string) $params['amount'], (string) $Currencyrate, 6);
-                    $usdtAmount = bcmul($tempAmount, (string) $this->exchangeRateDeviation, 2);
-                }
-
-                $usdtAmount = (float) $usdtAmount;
+                $payment = $this->calculateUsdtAmount($params);
 
                 $address = $this->getAvailableAddress(
                     $params['invoiceid'],
-                    $usdtAmount,
-                    (float) $params['amount'],
-                    $invoice['currency'] ?? 'USD',
-                    (float) $Currencyrate,
-                    $this->exchangeRateDeviation
+                    $payment['usdt_amount'],
+                    $payment['original_amount'],
+                    $payment['currency'],
+                    $payment['exchange_rate'],
+                    $payment['rate_deviation']
                 );
+
+                $usdtAmount = $payment['usdt_amount'];
 
                 $this->json([
                     'status' => true,
@@ -510,6 +501,336 @@ class App
     }
 
     /**
+     * 规范化汇率偏移值，避免空配置被转换成 0
+     */
+    protected function normalizeDeviation($value): float
+    {
+        if (is_numeric($value) && (float) $value > 0) {
+            return (float) $value;
+        }
+
+        return 1.00;
+    }
+
+    /**
+     * 从网关参数或发票记录解析应付金额
+     */
+    protected function resolveInvoiceAmount(array $params): float
+    {
+        foreach (['amount', 'basecurrencyamount'] as $key) {
+            $amount = $this->normalizeAmount($params[$key] ?? null);
+            if ($amount > 0) {
+                return $amount;
+            }
+        }
+
+        $invoice = (new Invoice())->with('transactions')->find($params['invoiceid'] ?? 0);
+        if (! $invoice) {
+            return 0.0;
+        }
+
+        $paid = (float) $invoice->transactions->sum('amountin');
+        $balance = round((float) $invoice->total - $paid, 2);
+
+        return $balance > 0 ? $balance : $this->normalizeAmount($invoice->total);
+    }
+
+    /**
+     * 解析发票货币代码
+     */
+    protected function resolveInvoiceCurrency(array $params): string
+    {
+        foreach ($this->extractCurrencyCandidates($params) as $code) {
+            if ($this->isKnownCurrencyCode($code)) {
+                return $code;
+            }
+        }
+
+        $defaultCode = Capsule::table('tblcurrencies')->where('default', 1)->value('code');
+
+        return $defaultCode ? strtoupper((string) $defaultCode) : 'USD';
+    }
+
+    /**
+     * 按优先级收集可能的发票货币
+     */
+    protected function extractCurrencyCandidates(array $params): array
+    {
+        $candidates = [];
+
+        $direct = $this->extractCurrencyCode($params['currency'] ?? null);
+        if ($direct !== '') {
+            $candidates[] = $direct;
+        }
+
+        if (isset($params['currencyId'])) {
+            $code = $this->currencyCodeById($params['currencyId']);
+            if ($code !== '') {
+                $candidates[] = $code;
+            }
+        }
+
+        $clientCurrency = $this->extractCurrencyCode($params['clientdetails']['currency'] ?? null);
+        if ($clientCurrency !== '') {
+            $candidates[] = $clientCurrency;
+        }
+
+        $userId = $params['clientdetails']['userid'] ?? $params['clientdetails']['id'] ?? null;
+        if (! $userId && ! empty($params['invoiceid'])) {
+            $userId = Capsule::table('tblinvoices')->where('id', $params['invoiceid'])->value('userid');
+        }
+
+        if ($userId && function_exists('getCurrency')) {
+            $currency = getCurrency($userId);
+            if (! empty($currency['code'])) {
+                $candidates[] = strtoupper((string) $currency['code']);
+            }
+        } elseif ($userId) {
+            $currencyId = Capsule::table('tblclients')->where('id', $userId)->value('currency');
+            $code = $this->currencyCodeById($currencyId);
+            if ($code !== '') {
+                $candidates[] = $code;
+            }
+        }
+
+        return array_values(array_unique($candidates));
+    }
+
+    /**
+     * 从网关参数中提取货币代码，兼容代码、ID 和数组
+     */
+    protected function extractCurrencyCode($value): string
+    {
+        if (is_array($value)) {
+            if (! empty($value['code'])) {
+                return strtoupper(trim((string) $value['code']));
+            }
+            if (! empty($value['id'])) {
+                return $this->currencyCodeById($value['id']);
+            }
+
+            return '';
+        }
+
+        if (is_numeric($value)) {
+            return $this->currencyCodeById($value);
+        }
+
+        if (! is_string($value)) {
+            return '';
+        }
+
+        $code = strtoupper(trim($value));
+        if (preg_match('/^[A-Z]{3}$/', $code)) {
+            return $code;
+        }
+
+        return '';
+    }
+
+    protected function currencyCodeById($currencyId): string
+    {
+        if (! is_numeric($currencyId) || (int) $currencyId <= 0) {
+            return '';
+        }
+
+        $code = Capsule::table('tblcurrencies')->where('id', (int) $currencyId)->value('code');
+
+        return $code ? strtoupper((string) $code) : '';
+    }
+
+    protected function isKnownCurrencyCode(string $code): bool
+    {
+        if ($code === '') {
+            return false;
+        }
+
+        return Capsule::table('tblcurrencies')->where('code', $code)->exists();
+    }
+
+    /**
+     * 避免把已经是USD的金额再按其他货币换算
+     */
+    protected function normalizePayableCurrency(array $params, float $amount, string $currency): string
+    {
+        if (in_array($currency, ['USD', 'USDT', 'USDC'], true)) {
+            return 'USD';
+        }
+
+        $default = Capsule::table('tblcurrencies')->where('default', 1)->first();
+        if (! $default || strtoupper((string) $default->code) !== 'USD') {
+            return $currency;
+        }
+
+        $baseAmount = $this->normalizeAmount($params['basecurrencyamount'] ?? null);
+        if ($baseAmount > 0 && abs($amount - $baseAmount) < 0.009) {
+            return 'USD';
+        }
+
+        return $currency;
+    }
+
+    /**
+     * 清洗金额字符串
+     */
+    protected function normalizeAmount($value): float
+    {
+        if (is_numeric($value)) {
+            return round((float) $value, 6);
+        }
+
+        if (! is_string($value) || trim($value) === '') {
+            return 0.0;
+        }
+
+        $filtered = preg_replace('/[^\d,.\-]/', '', $value);
+        if ($filtered === null || $filtered === '' || $filtered === '-') {
+            return 0.0;
+        }
+
+        if (strpos($filtered, ',') !== false && strpos($filtered, '.') !== false) {
+            if (strrpos($filtered, ',') > strrpos($filtered, '.')) {
+                $filtered = str_replace('.', '', $filtered);
+                $filtered = str_replace(',', '.', $filtered);
+            } else {
+                $filtered = str_replace(',', '', $filtered);
+            }
+        } elseif (preg_match('/,\d{1,2}$/', $filtered)) {
+            $filtered = str_replace(',', '.', $filtered);
+        } else {
+            $filtered = str_replace(',', '', $filtered);
+        }
+
+        return is_numeric($filtered) ? round((float) $filtered, 6) : 0.0;
+    }
+
+    /**
+     * 将发票金额转换为USD
+     * 优先使用WHMCS货币汇率；未启用USD时回退到在线汇率
+     *
+     * @return array{0: float, 1: float} [usdAmount, exchangeRate]
+     */
+    protected function convertAmountToUsd(float $amount, string $currency): array
+    {
+        $currency = strtoupper($currency);
+        if (in_array($currency, ['USD', 'USDT', 'USDC'], true)) {
+            return [$amount, 1.0];
+        }
+
+        $from = Capsule::table('tblcurrencies')->where('code', $currency)->first();
+        $usd = Capsule::table('tblcurrencies')->where('code', 'USD')->first();
+
+        if ($usd && (float) $usd->rate > 0) {
+            $fromId = $from->id ?? Capsule::table('tblcurrencies')->where('default', 1)->value('id');
+
+            if ($fromId && function_exists('convertCurrency')) {
+                $converted = $this->normalizeAmount(convertCurrency($amount, $fromId, $usd->id));
+                $fromRate = ($from && (float) $from->rate > 0) ? (float) $from->rate : 1.0;
+                if ($converted > 0) {
+                    return [$converted, (float) $usd->rate / $fromRate];
+                }
+            }
+
+            if ($from && (float) $from->rate > 0) {
+                $converted = (float) bcmul(
+                    bcdiv((string) $amount, (string) $from->rate, 8),
+                    (string) $usd->rate,
+                    6
+                );
+                if ($converted > 0) {
+                    return [$converted, (float) $usd->rate / (float) $from->rate];
+                }
+            }
+        }
+
+        $rate = $this->fetchOnlineUsdRate($currency);
+        $converted = (float) bcmul((string) $amount, (string) $rate, 6);
+        if ($converted <= 0) {
+            throw new RuntimeException('无法将 ' . $currency . ' 转换为USDT：WHMCS未启用USD，在线汇率换算结果无效。');
+        }
+
+        return [$converted, $rate];
+    }
+
+    /**
+     * 在WHMCS没有USD货币时，从公开汇率接口获取 1 单位原币兑USD
+     */
+    protected function fetchOnlineUsdRate(string $currency): float
+    {
+        $currency = strtoupper($currency);
+        $http = new Client(['timeout' => 10]);
+
+        $endpoints = [
+            [
+                'url' => 'https://api.frankfurter.app/latest',
+                'query' => ['from' => $currency, 'to' => 'USD'],
+                'path' => ['rates', 'USD'],
+            ],
+            [
+                'url' => 'https://open.er-api.com/v6/latest/' . rawurlencode($currency),
+                'query' => [],
+                'path' => ['rates', 'USD'],
+            ],
+        ];
+
+        foreach ($endpoints as $endpoint) {
+            try {
+                $options = [];
+                if (! empty($endpoint['query'])) {
+                    $options['query'] = $endpoint['query'];
+                }
+
+                $response = $http->get($endpoint['url'], $options);
+                $data = json_decode((string) $response->getBody(), true);
+                $rate = $data;
+                foreach ($endpoint['path'] as $key) {
+                    $rate = is_array($rate) ? ($rate[$key] ?? null) : null;
+                }
+
+                if (is_numeric($rate) && (float) $rate > 0) {
+                    return (float) $rate;
+                }
+            } catch (Throwable $e) {
+                continue;
+            }
+        }
+
+        throw new RuntimeException('无法获取 ' . $currency . ' 对USD的汇率。WHMCS未启用USD时需要访问在线汇率接口，请检查服务器出网，或重新启用USD货币。');
+    }
+
+    /**
+     * 计算应付USDT金额及汇率快照
+     */
+    protected function calculateUsdtAmount(array $params): array
+    {
+        $originalAmount = $this->resolveInvoiceAmount($params);
+        if ($originalAmount <= 0) {
+            throw new RuntimeException('发票金额无效，无法创建USDT支付订单。');
+        }
+
+        $currency = $this->normalizePayableCurrency(
+            $params,
+            $originalAmount,
+            $this->resolveInvoiceCurrency($params)
+        );
+        $deviation = $this->exchangeRateDeviation > 0 ? $this->exchangeRateDeviation : 1.00;
+        [$usdAmount, $exchangeRate] = $this->convertAmountToUsd($originalAmount, $currency);
+
+        $usdtAmount = (float) bcmul((string) $usdAmount, (string) $deviation, 2);
+        if ($usdtAmount <= 0) {
+            throw new RuntimeException('USDT金额计算结果为0，请检查WHMCS货币汇率与汇率偏移值配置。');
+        }
+
+        return [
+            'usdt_amount' => $usdtAmount,
+            'original_amount' => $originalAmount,
+            'currency' => $currency,
+            'exchange_rate' => $exchangeRate,
+            'rate_deviation' => $deviation,
+        ];
+    }
+
+    /**
      * 渲染USDT支付页面HTML
      *
      * @param array $params 支付参数
@@ -524,8 +845,22 @@ class App
             $validAddress->renew($this->timeout);
             $validTill = Carbon::now()->addMinutes($this->timeout)->toDateTimeString();
 
-            // 直接使用数据库中存储的USDT金额，避免重复计算
-            $amount = $validAddress['usdt_amount'] ?? 0;
+            $amount = (float) ($validAddress['usdt_amount'] ?? 0);
+            if ($amount <= 0) {
+                try {
+                    $payment = $this->calculateUsdtAmount($params);
+                    $validAddress->forceFill([
+                        'usdt_amount' => $payment['usdt_amount'],
+                        'original_amount' => $payment['original_amount'],
+                        'currency' => $payment['currency'],
+                        'exchange_rate' => $payment['exchange_rate'],
+                        'rate_deviation' => $payment['rate_deviation'],
+                    ])->save();
+                    $amount = $payment['usdt_amount'];
+                } catch (Throwable $e) {
+                    return '<div class="alert alert-danger">' . htmlspecialchars($e->getMessage(), ENT_QUOTES, 'UTF-8') . '</div>';
+                }
+            }
 
             return $this->view('payment.tpl', [
                 'address' => $validAddress['to_address'],
