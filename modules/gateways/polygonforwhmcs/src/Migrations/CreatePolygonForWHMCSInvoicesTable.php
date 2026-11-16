@@ -38,10 +38,12 @@ class CreatePolygonForWHMCSInvoicesTable
                 $table->index('invoice_id');
                 $table->index('to_address');
                 $table->index(['is_released', 'expires_on']);
+                $table->unique('transaction_id', 'polywhmcs_txid_unique');
             });
         } else {
             // 表已存在时，检查并添加缺失的字段（支持平滑升级）
             $this->addMissingColumns($schema);
+            $this->addUniqueTransactionIdIndex($schema);
         }
     }
 
@@ -103,6 +105,36 @@ class CreatePolygonForWHMCSInvoicesTable
                     }
                 });
             }
+        }
+    }
+
+    /**
+     * 为已入账的 transaction_id 添加唯一索引，防止同一链上交易被重复入账。
+     * 未支付行保持 NULL；MySQL UNIQUE 允许多个 NULL。
+     *
+     * @param $schema 数据库架构构建器
+     * @return void
+     */
+    private function addUniqueTransactionIdIndex($schema)
+    {
+        if (! $schema->hasTable('mod_polygonforwhmcs_pay_invoices')) {
+            return;
+        }
+
+        if (! $schema->hasColumn('mod_polygonforwhmcs_pay_invoices', 'transaction_id')) {
+            return;
+        }
+
+        try {
+            Capsule::table('mod_polygonforwhmcs_pay_invoices')
+                ->where('transaction_id', '')
+                ->update(['transaction_id' => null]);
+
+            $schema->table('mod_polygonforwhmcs_pay_invoices', function (Blueprint $table) {
+                $table->unique('transaction_id', 'polywhmcs_txid_unique');
+            });
+        } catch (\Throwable $e) {
+            // 索引已存在，或历史数据中已有重复非空 transaction_id。
         }
     }
 }

@@ -23,7 +23,7 @@ class Transaction extends Model
     public function firstByTransId(string $transId)
     {
         return $this->newQuery()
-            ->where('transid', $transId)
+            ->whereRaw('LOWER(transid) = ?', [strtolower($transId)])
             ->first();
     }
 }

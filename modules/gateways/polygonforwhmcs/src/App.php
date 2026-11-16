@@ -9,6 +9,7 @@ use PolygonForWHMCS\Exceptions\NoAddressAvailable;
 use PolygonForWHMCS\Models\Invoice;
 use PolygonForWHMCS\Models\PolygonForWHMCSInvoice;
 use PolygonForWHMCS\Models\Transaction;
+use PolygonForWHMCS\Support\UsdtTransferFinder;
 use RuntimeException;
 use Smarty;
 use Throwable;
@@ -49,7 +50,13 @@ class App
         'apikey' => [
             'FriendlyName' => 'Etherscan V2 API密钥',
             'Type' => 'text',
-            'Description' => '从 https://etherscan.io/apis 获取的API密钥，支持Polygon等多链查询',
+            'Description' => '从 https://etherscan.io/apis 获取的API密钥。现仅作为补充检测；主路径请配置下方 Polygon JSON-RPC URL。',
+        ],
+        'rpcUrl' => [
+            'FriendlyName' => 'Polygon JSON-RPC URL',
+            'Type' => 'text',
+            'Size' => '80',
+            'Description' => '推荐配置。用于 eth_getLogs 按官方 USDT 合约、收款地址和 start_block 直接读取链上 Transfer，不依赖 Polygonscan/Etherscan 的 tokentx 索引。建议使用自有节点或 Alchemy / Infura / QuickNode 等稳定节点。留空时回退到 Etherscan tokentx（索引延迟或返回 No transactions found 时可能漏单）。公共节点（例如 https://polygon-rpc.com）可临时使用，但可能限流，不要当作硬依赖。请勿把带密钥的 URL 提交到公开仓库。',
         ],
         'exchangeRateDeviation' => [
             'FriendlyName' => '汇率偏移值',
@@ -81,11 +88,25 @@ class App
     protected $apikey;
 
     /**
+     * Polygon JSON-RPC URL（可选）
+     *
+     * @var string
+     */
+    protected $rpcUrl;
+
+    /**
      * 汇率偏移值
      *
      * @var float
      */
     protected $exchangeRateDeviation;
+
+    /**
+     * USDT 转账检测器
+     *
+     * @var UsdtTransferFinder
+     */
+    protected $transferFinder;
 
     /**
      * 创建应用实例
@@ -110,10 +131,15 @@ class App
             }
         }
 
-        $this->timeout = $params['timeout'] ?? 30;
+        $this->timeout = (int) ($params['timeout'] ?? 30);
+        if ($this->timeout <= 0) {
+            $this->timeout = 30;
+        }
         $this->addresses = array_filter(preg_split("/\r\n|\n|\r/", $params['addresses'] ?? ''));
-        $this->apikey = $params['apikey'];
+        $this->apikey = trim((string) ($params['apikey'] ?? ''));
+        $this->rpcUrl = trim((string) ($params['rpcUrl'] ?? ''));
         $this->exchangeRateDeviation = $this->normalizeDeviation($params['exchangeRateDeviation'] ?? null);
+        $this->transferFinder = new UsdtTransferFinder($this->apikey, $this->rpcUrl);
 
         $this->smarty = new Smarty();
         $this->smarty->setTemplateDir(Polygon_PAY_ROOT . DIRECTORY_SEPARATOR . 'templates');
@@ -185,7 +211,14 @@ class App
         $polygonInvoice = (new PolygonForWHMCSInvoice())->firstValidByInvoiceId($params['invoiceid']);
         if ($polygonInvoice) {
             $invoice = (new Invoice())->with('transactions')->find($params['invoiceid']);
-            $this->checkTransaction($polygonInvoice);
+            try {
+                $this->checkTransaction($polygonInvoice);
+            } catch (Throwable $e) {
+                logTransaction('PolygonForWHMCS Invoice Status Error', [
+                    'invoice_id' => $params['invoiceid'] ?? null,
+                    'error' => $e->getMessage(),
+                ], 'Check Failed');
+            }
             $polygonInvoice = $polygonInvoice->refresh();
 
             if (mb_strtolower($invoice['status']) === 'unpaid') {
@@ -221,16 +254,28 @@ class App
      */
     protected function checkTransaction(PolygonForWHMCSInvoice $invoice)
     {
-        $this->getTransactions($invoice['to_address'], $invoice['start_block'])
+        $this->getTransactions($invoice['to_address'], (int) ($invoice['start_block'] ?? 0))
             ->each(function ($transaction) use ($invoice) {
-                $whmcsTransaction = (new Transaction())->firstByTransId($transaction['hash']);
-                $whmcsInvoice = Invoice::find($invoice['invoice_id']);
-                // If current invoice has been paid ignore it.
-                if ($whmcsTransaction) {
+                $hash = strtolower((string) ($transaction['hash'] ?? ''));
+                if ($hash === '') {
                     return;
                 }
 
-                if (mb_strtolower($whmcsInvoice['status']) === 'paid') {
+                $whmcsTransaction = (new Transaction())->firstByTransId($hash);
+                if ($whmcsTransaction) {
+                    if ((int) ($whmcsTransaction->invoiceid ?? 0) === (int) $invoice['invoice_id']
+                        && ! $invoice['is_paid']) {
+                        $invoice->markAsPaid((string) ($transaction['from'] ?? ''), $hash);
+                    }
+                    return;
+                }
+
+                if ((new PolygonForWHMCSInvoice())->hasTransactionIdExcept($hash, (int) $invoice['id'])) {
+                    return;
+                }
+
+                $whmcsInvoice = Invoice::find($invoice['invoice_id']);
+                if (! $whmcsInvoice || mb_strtolower($whmcsInvoice['status']) === 'paid') {
                     return;
                 }
 
@@ -239,13 +284,10 @@ class App
                     return;
                 }
 
-                // 验证USDT合约地址（Polygon主网合约）
-                $usdtContract = '0xc2132d05d31c914a87c6611c10748aeb04b58e8f';
-                if (mb_strtolower($transaction['contractAddress']) !== mb_strtolower($usdtContract)) {
+                // 验证USDT合约地址（Polygon主网官方合约，代币符号可能是 USDT 或 USDT0）
+                if (mb_strtolower($transaction['contractAddress']) !== UsdtTransferFinder::USDT_CONTRACT) {
                     return;
                 }
-
-                // 跳过tokenSymbol检查，API可能返回USDT、USDT0等不同变体
 
                 // 使用bcmath高精度转换收到的USDT金额
                 $receivedUSDTRaw = bcdiv((string) $transaction['value'], '1000000', 6);
@@ -267,38 +309,58 @@ class App
                         'expected_usdt' => $expectedUSDT,
                         'difference' => $difference,
                         'tolerance' => $tolerance,
-                        'transaction_hash' => $transaction['hash'],
+                        'transaction_hash' => $hash,
                         'invoice_id' => $invoice['invoice_id']
                     ], 'Amount Validation Failed');
                     return;
                 }
 
-                // 使用数据库存储的原始发票金额进行支付记录
-                $actualAmount = (float) $invoice['original_amount'];
+                try {
+                    if (! $invoice->claimTransactionId($hash)) {
+                        return;
+                    }
 
-                AddInvoicePayment(
-                    $invoice['invoice_id'], // 发票ID
-                    $transaction['hash'], // 交易哈希
-                    $actualAmount, // 支付金额
-                    0, // 交易手续费
-                    'polygonforwhmcs' // 网关标识
+                    AddInvoicePayment(
+                        $invoice['invoice_id'],
+                        $hash,
+                        (float) $invoice['original_amount'],
+                        0,
+                        'polygonforwhmcs'
+                    );
 
-                );
+                    logTransaction('PolygonForWHMCS', $transaction, 'Successfully Paid');
 
-                logTransaction('PolygonForWHMCS', $transaction, 'Successfully Paid');
+                    $whmcsInvoice = $whmcsInvoice->refresh();
+                    if (mb_strtolower($whmcsInvoice['status']) === 'paid') {
+                        $invoice->markAsPaid($transaction['from'], $hash);
+                    } else {
+                        $invoice->renew($this->timeout);
+                    }
+                } catch (Throwable $e) {
+                    if (! $this->isTransactionCreditedInWhmcs($hash)) {
+                        $invoice->releaseTransactionClaim($hash);
+                    }
 
-                $whmcsInvoice = $whmcsInvoice->refresh();
-                // 如果发票已完全支付则释放地址，否则续期
-                if (mb_strtolower($whmcsInvoice['status']) === 'paid') {
-                    $invoice->markAsPaid($transaction['from'], $transaction['hash']);
-                } else {
-                    $invoice->renew($this->timeout);
+                    logTransaction('PolygonForWHMCS Credit Error', [
+                        'invoice_id' => $invoice['invoice_id'],
+                        'transaction_hash' => $hash,
+                        'error' => $e->getMessage(),
+                    ], 'Credit Failed');
                 }
             });
     }
 
     /**
-     * 使用Etherscan V2 API获取Polygon USDT代币交易
+     * 该链上交易是否已写入 WHMCS 账务表
+     */
+    protected function isTransactionCreditedInWhmcs(string $hash): bool
+    {
+        return (bool) (new Transaction())->firstByTransId($hash);
+    }
+
+    /**
+     * 获取打入指定地址的 Polygon USDT 转账。
+     * 主路径为 JSON-RPC eth_getLogs，Etherscan tokentx 仅作补充。
      *
      * @param string $address 钱包地址
      * @param int $startblock 起始区块号
@@ -307,45 +369,7 @@ class App
      */
     protected function getTransactions(string $address, int $startblock): Collection
     {
-        $http = new Client([
-            'base_uri' => 'https://api.etherscan.io',
-            'timeout' => 30,
-        ]);
-
-        $response = $http->get("/v2/api", [
-            'query' => [
-                'chainid' => 137, // Polygon chain ID
-                'module' => "account",
-                'action' => "tokentx",
-                'address' => $address,
-                'page' => 1,
-                'offset' => 5,
-                'startblock' => $startblock,
-                'sort' => "desc",
-                'apikey' => $this->apikey,
-            ],
-        ]);
-
-        $data = json_decode($response->getBody()->getContents(), true);
-
-        // 检查API响应
-        if (! isset($data['result']) || $data['status'] !== '1') {
-            logTransaction('PolygonForWHMCS API Error', [
-                'endpoint' => 'tokentx',
-                'address' => $address,
-                'response' => $data
-            ], 'API Error');
-
-            return new Collection([]);
-        }
-
-        // 过滤USDT交易（Polygon主网USDT合约地址）
-        $usdtContract = '0xc2132d05d31c914a87c6611c10748aeb04b58e8f';
-        $usdtTransactions = array_filter($data['result'], function ($transaction) use ($usdtContract) {
-            return mb_strtolower($transaction['contractAddress']) === mb_strtolower($usdtContract);
-        });
-
-        return new Collection($usdtTransactions);
+        return $this->transferFinder->find($address, $startblock);
     }
 
     /**
@@ -476,28 +500,7 @@ class App
      */
     protected function getNowPolygonBlock(): int
     {
-        $http = new Client([
-            'base_uri' => 'https://api.etherscan.io',
-            'timeout' => 30,
-        ]);
-
-        $response = $http->get("/v2/api", [
-            'query' => [
-                'chainid' => 137, // Polygon chain ID
-                'module' => "proxy",
-                'action' => "eth_blockNumber",
-                'apikey' => $this->apikey,
-            ],
-        ]);
-
-        $data = json_decode($response->getBody()->getContents(), true);
-
-        if (isset($data['result'])) {
-            return hexdec($data['result']); // 转换十六进制到十进制
-        }
-
-        // API调用失败时返回0，避免阻塞流程
-        return 0;
+        return $this->transferFinder->latestBlock();
     }
 
     /**
@@ -912,7 +915,14 @@ class App
         $invoices = (new PolygonForWHMCSInvoice())->getValidInvoices();
 
         $invoices->each(function ($invoice) {
-            $this->checkTransaction($invoice);
+            try {
+                $this->checkTransaction($invoice);
+            } catch (Throwable $e) {
+                logTransaction('PolygonForWHMCS Cron Error', [
+                    'invoice_id' => $invoice['invoice_id'] ?? null,
+                    'error' => $e->getMessage(),
+                ], 'Check Failed');
+            }
         });
     }
 }

@@ -6,6 +6,7 @@ use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Collection;
+use Throwable;
 
 class PolygonForWHMCSInvoice extends Model
 {
@@ -204,5 +205,67 @@ class PolygonForWHMCSInvoice extends Model
             ->where('is_released', 0)
             ->latest('id')
             ->first();
+    }
+
+    /**
+     * 该链上交易哈希是否已被其他插件行占用。
+     */
+    public function hasTransactionIdExcept(string $transactionId, int $exceptId): bool
+    {
+        return $this->newQuery()
+            ->where('id', '!=', $exceptId)
+            ->whereNotNull('transaction_id')
+            ->where('transaction_id', '!=', '')
+            ->whereRaw('LOWER(transaction_id) = ?', [strtolower($transactionId)])
+            ->exists();
+    }
+
+    /**
+     * 抢占交易哈希，防止并发重复入账。MySQL UNIQUE 允许多个 NULL。
+     */
+    public function claimTransactionId(string $transactionId): bool
+    {
+        $transactionId = strtolower($transactionId);
+        if ($transactionId === '') {
+            return false;
+        }
+
+        $current = strtolower((string) ($this->transaction_id ?? ''));
+        if ($current !== '') {
+            return $current === $transactionId;
+        }
+
+        try {
+            $affected = $this->newQuery()
+                ->where('id', $this->id)
+                ->where(function ($query) {
+                    $query->whereNull('transaction_id')
+                        ->orWhere('transaction_id', '');
+                })
+                ->update(['transaction_id' => $transactionId]);
+
+            if ($affected > 0) {
+                $this->transaction_id = $transactionId;
+
+                return true;
+            }
+        } catch (Throwable $e) {
+            return false;
+        }
+
+        return false;
+    }
+
+    /**
+     * 入账失败时释放已抢占的交易哈希，以便后续重试。
+     */
+    public function releaseTransactionClaim(string $transactionId): void
+    {
+        $this->newQuery()
+            ->where('id', $this->id)
+            ->whereRaw('LOWER(transaction_id) = ?', [strtolower($transactionId)])
+            ->update(['transaction_id' => null]);
+
+        $this->transaction_id = null;
     }
 }
