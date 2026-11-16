@@ -4,8 +4,8 @@
 
 ## ✨ 主要特性
 
-- 🔗 **多链支持** - 基于Etherscan V2 API，支持Polygon等多个EVM链
-- 💰 **自动收款确认** - 实时监控USDT转账，自动确认订单支付
+- 🔗 **链上直读** - 主检测走 Polygon JSON-RPC `eth_getLogs`，不依赖 Polygonscan/Etherscan 的 tokentx 索引
+- 💰 **自动收款确认** - 实时监控官方 USDT 合约转入，自动确认订单支付
 - 📊 **智能汇率处理** - 支持多种货币和自定义汇率偏移（优惠/手续费）
 - 🎯 **高精度计算** - 使用bcmath进行高精度数学运算，避免浮点数误差
 - 🏦 **多地址管理** - 支持配置多个收款地址，实现并发支付
@@ -17,7 +17,8 @@
 - **WHMCS** 8.1+
 - **PHP** 8.0+
 - **PHP扩展**: bcmath, json, curl
-- **Etherscan V2 API Key** - [免费获取](https://etherscan.io/apis)
+- **Polygon JSON-RPC URL**（推荐）- 自有节点，或 Alchemy / Infura / QuickNode 等
+- **Etherscan V2 API Key**（补充检测，可选）- [免费获取](https://etherscan.io/apis)
 
 ## 📥 安装步骤
 
@@ -39,12 +40,13 @@ cp -r WHMCS-PolygonUSDT/* /path/to/whmcs/
 3. 找到并启用 `Polygon USDT支付`
 4. 配置以下参数：
 
-| 参数                     | 说明              | 示例                                 |
-|------------------------|-----------------|------------------------------------|
-| **USDT收款地址**           | 每行一个Polygon钱包地址 | `0x1234...abcd`<br>`0x5678...efgh` |
-| **支付超时时间**             | 支付超时时间（分钟）      | `30`                               |
-| **Etherscan V2 API密钥** | 从etherscan.io获取 | `5HUVPWXU...`                      |
-| **汇率偏移值**              | 小于1给优惠，大于1收手续费  | `0.96`（4%优惠）<br>`1.02`（2%手续费）      |
+| 参数                      | 说明 | 示例 |
+|-------------------------|------|------|
+| **USDT收款地址**            | 每行一个Polygon钱包地址 | `0x1234...abcd`<br>`0x5678...efgh` |
+| **支付超时时间**              | 支付超时时间（分钟） | `30` |
+| **Polygon JSON-RPC URL** | 推荐。用于 `eth_getLogs` 直读链上 USDT Transfer | `https://polygon-mainnet.g.alchemy.com/v2/你的密钥` |
+| **Etherscan V2 API密钥**  | 补充检测。tokentx 索引延迟时不能作为唯一依据 | 从 etherscan.io 获取 |
+| **汇率偏移值**               | 小于1给优惠，大于1收手续费 | `0.96`（4%优惠）<br>`1.02`（2%手续费） |
 
 ### 3. 验证安装
 
@@ -59,8 +61,10 @@ cp -r WHMCS-PolygonUSDT/* /path/to/whmcs/
 1. **生成订单** → 系统分配一个空闲收款地址
 2. **计算金额** → 根据汇率和偏移值计算USDT支付金额
 3. **用户支付** → 用户向指定地址转账USDT
-4. **自动确认** → 系统监控区块链，自动确认收款
+4. **自动确认** → Cron / 发票页 AJAX 先查 Polygon RPC `eth_getLogs`（官方 USDT 合约 + 收款地址 + `start_block`），再以 Etherscan `tokentx` 作补充；`status=0 / No transactions found` 视为空列表而非 API 失败
 5. **订单完成** → 释放地址，标记订单为已支付
+
+同一笔链上交易只会入账一次：会同时检查 WHMCS `tblaccounts` 和插件表 `transaction_id`（唯一索引，NULL 未支付行可并存）。
 
 ### 金额计算公式
 
@@ -76,6 +80,16 @@ cp -r WHMCS-PolygonUSDT/* /path/to/whmcs/
 - **优惠模式**: 设置 < 1.0（如0.96 = 4%优惠）
 - **手续费模式**: 设置 > 1.0（如1.02 = 2%手续费）
 - **无偏移**: 设置 = 1.0
+
+### Polygon JSON-RPC URL
+
+主检测依赖该 URL，请在网关设置中填写 Polygon 主网（chainId 137）的 HTTP JSON-RPC 地址：
+
+1. **推荐**：自有节点，或 Alchemy / Infura / QuickNode 等带配额的节点（URL 中的密钥仅保存在 WHMCS 后台，不要写入仓库）。
+2. **未配置**：已有安装可继续工作，系统会回退到 Etherscan `tokentx`。此时若 Polygonscan 索引损坏或返回空结果，将**不会**再把空结果记为硬错误，但也可能因此漏单，所以生产环境仍建议配置 RPC。
+3. **公共节点**：如 `https://polygon-rpc.com` 可临时使用，可能限流或不稳定，不要当作唯一依赖。
+
+查询会按官方 USDT 合约 `0xc2132D05D31c914a87C6611C10748AEb04B58e8F`、当前发票收款地址和 `start_block` 过滤，并在节点限制区块跨度时自动分片，不会全量扫描合约历史。
 
 ### 多地址配置
 
@@ -104,10 +118,13 @@ modules/gateways/
     ├── autoload.php                 # 自动加载器
     ├── src/
     │   ├── App.php                  # 核心应用类
+    │   ├── Exceptions/
     │   ├── Models/                  # 数据模型
     │   │   ├── Invoice.php
     │   │   ├── PolygonForWHMCSInvoice.php
     │   │   └── Transaction.php
+    │   ├── Support/                 # 链上检测
+    │   │   └── UsdtTransferFinder.php
     │   └── Migrations/              # 数据库迁移
     │       └── CreatePolygonForWHMCSInvoicesTable.php
     └── templates/                   # 前端模板
@@ -140,6 +157,14 @@ modules/gateways/
 本项目采用 [MIT License](LICENSE) 开源协议。
 
 ## 🔄 更新日志
+
+### v2.1.0 (2026-11-16)
+
+- ✨ 主检测改为 Polygon JSON-RPC `eth_getLogs`，按官方 USDT 合约、收款地址和 `start_block` 过滤
+- ✨ Etherscan `tokentx` 降为补充路径，并分页查询，避免 `offset=5` 漏单
+- 🐛 `status=0 / No transactions found` 视为空列表，不再当作 API 失败而跳过匹配
+- ✨ 新增可选「Polygon JSON-RPC URL」网关设置；未配置时保持安全回退
+- ✨ `transaction_id` 唯一索引，防止同一链上交易重复入账
 
 ### v2.0.0 (2025-01-XX)
 
